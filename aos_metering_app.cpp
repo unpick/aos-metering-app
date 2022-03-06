@@ -35,8 +35,8 @@ const std::string APP_PATH = "./" + APP_RESOURCE;               // Relative path
 const std::string APP_PATH_CONFIG = APP_PATH + "/reportInterval";
 const int MAX_INSTANCE_AGE_S = 900;                             // Duration to create containers for
 const int BACKOFF_DEFAULT_S = 30;
-const int SAMPLE_PERIOD_DEFAULT = 5;                            // Time between information requests from the mtrsvc, in seconds
-const int REPORT_PERIOD_DEFAULT = 30;                           // Time between meter information reports to the IN-AE, in seconds
+const int SAMPLE_PERIOD_DEFAULT = 1;                            // Time between information requests from the mtrsvc, in seconds
+const int REPORT_PERIOD_DEFAULT = 3600;                         // Time between meter information reports to the IN-AE, in seconds
 const bool SPOOF_METER = false;                                 // Set to true if using metersim
 
 // Member objects
@@ -273,6 +273,7 @@ void spoofSample(Sample& sample)
 {
     sample.p1.vrms = EXPECTED_VOLTAGE;
     sample.frequency = EXPECTED_FREQUENCY;
+    logDebug("Spoofed " << sample.p1.vrms << " V at " << sample.frequency << " Hz");
 }
 
 // Create a subscription with the given name to content instances created in the given parent path.
@@ -610,7 +611,7 @@ void notificationCallback(m2m::Notification notification)
 
         parseReportInterval(seconds);
     }
-    else if (rn.compare(0, 3, "rri") == 0 && rn.compare(15, 16, "-contentInstance") == 0)
+    else if (rn.compare(0, 3, "rri") == 0 && rn.compare(rn.length() - 16, 16, "-contentInstance") == 0)
     {
         auto meterRead = contentInstance.content->extractUnnamed<xsd::mtrsvc::MeterRead>();
         auto &meterSvcData = *meterRead.meterSvcData;
@@ -651,6 +652,7 @@ void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData)
     }
 
     Sample sample;
+//    if (SPOOF_METER || !Sample::isValid(meterSvcData.powerQuality.getValue()))
     if (SPOOF_METER)
         spoofSample(sample);
     else

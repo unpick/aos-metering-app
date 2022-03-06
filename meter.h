@@ -84,6 +84,7 @@ namespace Meter
     {
         Sample() { frequency = 0.0; }
         Sample(const xsd::mtrsvc::PowerQualityData& powerQualityData) { set(powerQualityData); }
+        static bool isValid(const xsd::mtrsvc::PowerQualityData& powerQualityData);
         void set(const xsd::mtrsvc::PowerQualityData& powerQualityData);
         void reset() { p1.reset(); p2.reset(); p3.reset(); frequency = 0.0; }
 

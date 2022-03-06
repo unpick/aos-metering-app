@@ -21,6 +21,20 @@ void Phase::set(double vrms_, double irms_, double powerActive_, double powerRea
     powerFactor = powerFactor_;
 }
 
+// Return true if all required members are present in the powerQualityData, false otherwise.
+bool Sample::isValid(const xsd::mtrsvc::PowerQualityData& powerQualityData)
+{
+    if (powerQualityData.voltageA.empty() || powerQualityData.currentA.empty() || powerQualityData.activePowerA.empty()
+        || powerQualityData.reactivePowerA.empty() || powerQualityData.powerFactorA.empty() || powerQualityData.voltageB.empty()
+        || powerQualityData.currentB.empty() || powerQualityData.activePowerB.empty() || powerQualityData.reactivePowerB.empty()
+        || powerQualityData.powerFactorB.empty() || powerQualityData.voltageC.empty() || powerQualityData.currentC.empty()
+        || powerQualityData.activePowerC.empty() || powerQualityData.reactivePowerC.empty() || powerQualityData.powerFactorC.empty()
+        || powerQualityData.frequency.empty())
+        return false;
+
+    return true;
+}
+
 // Initialise the Sample from a PowerQualityData object.
 void Sample::set(const xsd::mtrsvc::PowerQualityData& powerQualityData)
 {
