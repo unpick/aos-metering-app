@@ -97,6 +97,8 @@ void SampleSummary::json(ordered_json& j) const
     frequency.json(tmp);
     j["f"] = tmp;
     j["n"] = count;
+    j["is"] = round((double)intervalMin.count() / 1000, 3);
+    j["il"] = round((double)intervalMax.count() / 1000, 3);
     j["ts"] = duration_cast<seconds>(tsStart.time_since_epoch()).count();
     j["te"] = duration_cast<seconds>(tsEnd.time_since_epoch()).count();
 }
@@ -216,6 +218,13 @@ bool Report::SampleAccumulator::accumulate(const Sample& sample)
     {
         count++;
         tsEnd = system_clock::now();
+        milliseconds interval = duration_cast<milliseconds>(tsEnd - tsLast);
+        if (interval < intervalMin)
+            intervalMin = interval;
+        if (interval > intervalMax)
+            intervalMax = interval;
+        tsLast = tsEnd;
+
         return true;
     }
 
@@ -232,6 +241,8 @@ bool Report::SampleAccumulator::summarise(SampleSummary& sampleSummary) const
     bool successP3 = p3.summarise(sampleSummary.p3, count);
     bool successF = frequency.summarise(sampleSummary.frequency, count);
     sampleSummary.count = count;
+    sampleSummary.intervalMin = intervalMin;
+    sampleSummary.intervalMax = intervalMax;
     sampleSummary.tsStart = tsStart;
     sampleSummary.tsEnd = tsEnd;
 

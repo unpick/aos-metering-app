@@ -135,14 +135,16 @@ namespace Meter
     {
         SampleSummary() { count = 0; }
         void json(ordered_json& j) const;
-        void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0;
-                       tsStart = tsEnd = system_clock::now(); }
+        void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0; intervalMin = milliseconds(INT32_MAX);
+                       intervalMax = milliseconds(0); tsStart = tsEnd = system_clock::now(); }
 
         PhaseSummary p1;
         PhaseSummary p2;
         PhaseSummary p3;
         Summary frequency;
         uint32_t count;
+        milliseconds intervalMin;
+        milliseconds intervalMax;
         time_point<system_clock> tsStart;
         time_point<system_clock> tsEnd;
     };
@@ -234,14 +236,17 @@ namespace Meter
             SampleAccumulator() { count = 0; }
             bool accumulate(const Sample& sample);
             bool summarise(SampleSummary& sampleSummary) const;
-            void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0;
-                           tsStart = tsEnd = system_clock::now(); }
+            void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0; intervalMin = milliseconds(INT32_MAX);
+                           intervalMax = milliseconds(0); tsLast = tsStart = tsEnd = system_clock::now(); }
 
             PhaseAccumulator p1;
             PhaseAccumulator p2;
             PhaseAccumulator p3;
             AccumulatorFrequency frequency;
             uint32_t count;
+            milliseconds intervalMin;
+            milliseconds intervalMax;
+            time_point<system_clock> tsLast;
             time_point<system_clock> tsStart;
             time_point<system_clock> tsEnd;
         };

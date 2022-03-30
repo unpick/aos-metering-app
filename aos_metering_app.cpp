@@ -22,7 +22,7 @@ using namespace Meter;
 
 ///////////////// Configure the following for your environment /////////////////
 
-const std::string APP_RESOURCE = "meterSummary";                // Public name of this app
+const std::string APP_RESOURCE = "meterSummary";                // Public name of this app; NOTE Must be unique across all apps
 const std::string APP_NAME = "com.grid-net.meterdemo";          // Name of the IN-AE to report to
 
 ////////////////////////////// End of site config //////////////////////////////
@@ -43,13 +43,9 @@ const bool SPOOF_METER = false;                                 // Set to true i
 m2m::AppEntity appEntity;                                       // OneM2M Application Entity (AE) object
 Report report;                                                  // mtrsvc sample accumulator and reporter
 int reportPeriod = REPORT_PERIOD_DEFAULT;
+milliseconds reportTime = milliseconds(0);                      // Scheduled time to transmit the next report
 
-std::mutex deletionMutex;                                       // Mutex for the content deletion thread's condition variable
-std::condition_variable deletionReady;                          // Condition variable blocking the content deletion thread
 std::queue<std::string> deletionQueue;                          // Queue to pass paths to the content deletion thread
-
-std::mutex reportMutex;                                         // Mutex for the report summary thread's condition variable
-std::condition_variable reportReady;                            // Condition variable blocking the report summary thread
 std::queue<SampleSummary> reportQueue;                          // Queue to pass report summaries to the report summary thread
 
 std::string containerPath;                                      // Path to IN-AE's container that we will create reports in
@@ -239,15 +235,17 @@ void deletion_queue_thread()
 {
     while (true)
     {
-        std::unique_lock<std::mutex> g(deletionMutex);
-        deletionReady.wait(g, []{ return !deletionQueue.empty(); });    // Block until a requester calls deletionReady.notify_one()
+        if (deletionQueue.empty())
+        {
+            std::this_thread::sleep_for(seconds{1});
+            continue;
+        }
 
         auto path = deletionQueue.front();
         deletionQueue.pop();
-        g.unlock();
-
         logDebug("Deleting content instance \"" << path << "\"");
-        delete_content_instance(path);
+        if (!delete_content_instance(path))
+            logError("Failed to delete content instance \"" << path << "\"");
     }
 }
 
@@ -256,15 +254,17 @@ void report_queue_thread()
 {
     while (true)
     {
-        std::unique_lock<std::mutex> g(reportMutex);
-        reportReady.wait(g, []{ return !reportQueue.empty(); });        // Block until a requester calls reportReady.notify_one()
+        if (reportQueue.empty())
+        {
+            std::this_thread::sleep_for(seconds{1});
+            continue;
+        }
 
         auto summary = reportQueue.front();
         reportQueue.pop();
-        g.unlock();
-
         logDebug("Sending summary of " << summary.count << " samples");
-        create_content_instance(containerPath, IN_AE_RESOURCE_NAME, summary);
+        if (!create_content_instance(containerPath, IN_AE_RESOURCE_NAME, summary))
+            logError("Failed to send summary");
     }
 }
 
@@ -447,6 +447,9 @@ bool create_container(const std::string& parentPath, const std::string& resource
 
     xsd::m2m::Container cnt = xsd::m2m::Container::Create();
     cnt.resourceName = resourceName;
+    // Hypothetically, setting a maximum of one instance should remove the need to delete instances after the IN-AE creates them.
+    // In practice, this doesn't seem to work, and the IN-CSE gives the IN-AE 405 errors after the first time.
+    cnt.maxNrOfInstances = 1;
     cnt.maxInstanceAge = maxInstanceAge;
 
     request.req->primitiveContent = xsd::toAnyNamed(cnt);
@@ -604,10 +607,8 @@ void notificationCallback(m2m::Notification notification)
 
         // Before parsing, delete the config content instance to prevent 405 errors the next time the IN-AE creates one.
 //        delete_content_instance(APP_PATH_CONFIG);
-        std::lock_guard<std::mutex> g(reportMutex);
         deletionQueue.push(APP_PATH_CONFIG);
         logDebug("Queued deletion of config content instance");
-        deletionReady.notify_one();
 
         parseReportInterval(seconds);
     }
@@ -631,12 +632,49 @@ void parseReportInterval(const int seconds)
         logInfo("Report interval of " << seconds << " s out of bounds; not changing");
         return;
     }
+
+    // Handle the interval change's impact on the next report time.  Note that if this results in a time in the past, a report will
+    // be sent immediately the next time we receive metersvc data, and thereafter according to the new interval.
+    reportTime += milliseconds((seconds - reportPeriod) * 1000);
+    milliseconds timeNow = duration_cast<milliseconds>(steady_clock::now().time_since_epoch());
+    if (reportTime < timeNow)
+        reportTime = timeNow;
+
     reportPeriod = seconds;
     logInfo("Report interval set to " << reportPeriod << " s");
 }
 
 void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData)
 {
+    // If the time to send a report has arrived, do so before parsing the new data.
+    milliseconds timeNow = duration_cast<milliseconds>(steady_clock::now().time_since_epoch());
+    if (timeNow >= reportTime)
+    {
+        if (reportTime <= milliseconds(0))
+        {
+            // First run; set an initial report time and continue.
+            reportTime = timeNow + milliseconds(reportPeriod * 1000 - 500);
+            report.reset();
+        }
+        else
+        {
+            SampleSummary sampleSummary;
+            report.summarise(sampleSummary);
+
+//            create_content_instance(containerPath, IN_AE_RESOURCE_NAME, sampleSummary);
+            reportQueue.push(sampleSummary);
+            logDebug("Queued summary of " << sampleSummary.count << " samples");
+
+            report.reset();
+            reportTime += milliseconds(reportPeriod * 1000);
+            if (reportTime <= timeNow)                              // Sanity check
+            {
+                logWarn("Report time in the past; resetting to " << reportPeriod << " s from now");
+                reportTime = timeNow + milliseconds(reportPeriod * 1000);
+            }
+        }
+    }
+
     std::ofstream output("meter_data.txt");
     logInfo("timestamp: " << meterSvcData.readTimeLocal);
     output << "timestamp: " << meterSvcData.readTimeLocal << '\n';
@@ -659,19 +697,4 @@ void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData)
         sample.set(meterSvcData.powerQuality.getValue());
     report.accumulate(sample);
     logInfo("Accumulated " << report.count() << (report.count() == 1 ? " sample" : " samples"));
-
-    // Simple interval-based check to see if it is time to report. A steady_clock-based mechanism might be more robust.
-    if (report.count() * SAMPLE_PERIOD_DEFAULT >= reportPeriod)
-    {
-        SampleSummary sampleSummary;
-        report.summarise(sampleSummary);
-
-//        create_content_instance(containerPath, IN_AE_RESOURCE_NAME, sampleSummary);
-        std::lock_guard<std::mutex> g(reportMutex);
-        reportQueue.push(sampleSummary);
-        logDebug("Queued summary of " << sampleSummary.count << " samples");
-        reportReady.notify_one();
-
-        report.reset();
-    }
 }
