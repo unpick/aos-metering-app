@@ -13,6 +13,9 @@
 #include <queue>
 #include <fstream>
 
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "meter.h"
 
 using namespace std::chrono;
@@ -29,10 +32,9 @@ const std::string APP_NAME = "com.grid-net.meterdemo";          // Name of the I
 
 
 const aos::LogLevel LOG_LEVEL = aos::LogLevel::LOG_INFO;        // Maximum logging level; set to LOG_DEBUG for more logread detail
-const std::string IN_CSE = "/PN_CSE";
-const std::string IN_AE_RESOURCE_NAME = "cnt-00001";
+const std::string IN_CSE = "/PN_CSE";                           // Absolute path to the IN-CSE
+const std::string IN_AE_RESOURCE_NAME = "";                     // Report content instance name; empty string for automatic names
 const std::string APP_PATH = "./" + APP_RESOURCE;               // Relative path of our local configuration container
-const std::string APP_PATH_CONFIG = APP_PATH + "/reportInterval";
 const int MAX_INSTANCE_AGE_S = 900;                             // Duration to create containers for
 const int BACKOFF_DEFAULT_S = 30;
 const int SAMPLE_PERIOD_DEFAULT = 1;                            // Time between information requests from the mtrsvc, in seconds
@@ -45,17 +47,16 @@ Report report;                                                  // mtrsvc sample
 int reportPeriod = REPORT_PERIOD_DEFAULT;
 milliseconds reportTime = milliseconds(0);                      // Scheduled time to transmit the next report
 
-std::queue<std::string> deletionQueue;                          // Queue to pass paths to the content deletion thread
 std::queue<SampleSummary> reportQueue;                          // Queue to pass report summaries to the report summary thread
 
 std::string containerPath;                                      // Path to IN-AE's container that we will create reports in
 
 // Function prototypes
 void spawn_threads();
-void deletion_queue_thread();
 void report_queue_thread();
 
 void spoofSample(Sample& sample);
+std::string singleQuoteToDoubleQuote(const std::string& s);
 
 bool create_subscription(const std::string& parentPath, const std::string& resourceName);
 bool create_meter_read_policy();
@@ -72,8 +73,8 @@ void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData);
 // Helper functions
 [[noreturn]] void usage(const char *prog)
 {
-        fprintf(stderr, "Usage %s [-d] [-p <POA-URI>|-a <IPADDR[:PORT]>] [CSE-URI]\n", prog);
-        exit(EXIT_FAILURE);
+    fprintf(stderr, "Usage %s [-d] [-p <POA-URI>|-a <IPADDR[:PORT]>] [CSE-URI]\n", prog);
+    exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[])
@@ -157,9 +158,6 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // Delete any existing config content instance to prevent a 405 error when the IN-AE creates one.
-        delete_content_instance(APP_PATH_CONFIG);
-
         if (!create_meter_read_policy())
         {
             logError("meter read policy creation failed");
@@ -216,37 +214,13 @@ int main(int argc, char *argv[])
     appEntity.waitForever();
 }
 
-// Spawn the background threads used to perform CoAP requests initiated from the message handler's context.
+// Spawn the background thread(s) used to perform CoAP requests initiated from the message handler's context.
 void spawn_threads()
 {
-    logDebug("Spawning content instance deletion thread ...");
-    std::thread content_instance_deletion_thread(deletion_queue_thread);
-    content_instance_deletion_thread.detach();
-    logDebug("Spawned content instance deletion thread");
-
     logDebug("Spawning meter summary publishing thread ...");
     std::thread meter_summary_publishing_thread(report_queue_thread);
     meter_summary_publishing_thread.detach();
     logDebug("Spawned meter summary publishing thread");
-}
-
-// Thread to delete content instances whose paths are passed in via deletionQueue.
-void deletion_queue_thread()
-{
-    while (true)
-    {
-        if (deletionQueue.empty())
-        {
-            std::this_thread::sleep_for(seconds{1});
-            continue;
-        }
-
-        auto path = deletionQueue.front();
-        deletionQueue.pop();
-        logDebug("Deleting content instance \"" << path << "\"");
-        if (!delete_content_instance(path))
-            logError("Failed to delete content instance \"" << path << "\"");
-    }
 }
 
 // Thread to report sample summaries passed in via reportQueue.
@@ -274,6 +248,20 @@ void spoofSample(Sample& sample)
     sample.p1.vrms = EXPECTED_VOLTAGE;
     sample.frequency = EXPECTED_FREQUENCY;
     logDebug("Spoofed " << sample.p1.vrms << " V at " << sample.frequency << " Hz");
+}
+
+// Take a string, convert all single quotes to double quotes, and return the result.
+std::string singleQuoteToDoubleQuote(const std::string& s)
+{
+    std::string result;
+    for (char c : s)
+    {
+        if (c == '\'')
+            result += '"';
+        else
+            result += c;
+    }
+    return result;
 }
 
 // Create a subscription with the given name to content instances created in the given parent path.
@@ -307,7 +295,7 @@ bool create_subscription(const std::string& parentPath, const std::string& resou
     appEntity.sendRequest(request);
     auto response = appEntity.getResponse(request);
 
-    logInfo("subscription: " << toString(response->responseStatusCode));
+    logInfo("Subscription: " << toString(response->responseStatusCode));
 
     return (response->responseStatusCode == xsd::m2m::ResponseStatusCode::CREATED
             || response->responseStatusCode == xsd::m2m::ResponseStatusCode::CONFLICT);
@@ -345,13 +333,13 @@ bool create_meter_read_policy()
     appEntity.sendRequest(request);
     auto response = appEntity.getResponse(request);
 
-    logInfo("policy creation: " << toString(response->responseStatusCode));
+    logInfo("Policy creation: " << toString(response->responseStatusCode));
 
     return (response->responseStatusCode == xsd::m2m::ResponseStatusCode::CREATED
             || response->responseStatusCode == xsd::m2m::ResponseStatusCode::CONFLICT);
 }
 
-// Discover the given CSE's AEs matching appName, and return the first (presumed to be the most recently created) via aePath.
+// Discover the given CSE's AE's matching appName, and return the first (presumed to be the most recently created) via aePath.
 bool discover_in_ae(const std::string& csePath, const std::string& appName, std::string& aePath)
 {
     aePath = "";
@@ -386,16 +374,24 @@ bool discover_in_ae(const std::string& csePath, const std::string& appName, std:
     for (int i = 0; i < json_str.length(); i += 150)
         logDebug("AE discovery [" << i << "]: " << json_str.substr(i, i + 150));
 
-    auto json = nlohmann::json::parse(json_str);
-    if (json.at("m2m:uril").size() < 1)
+    try
     {
-        logWarn("Could not find an AE with appName " + appName);
+        auto json = nlohmann::json::parse(json_str);
+        if (json.at("m2m:uril").size() < 1)
+        {
+            logWarn("Could not find an AE with appName " + appName);
+            return false;
+        }
+
+        aePath = json.at("m2m:uril")[0].get<std::string>();
+
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        logError("Failed to parse discovered IN-AE: " << e.what());
         return false;
     }
-
-    aePath = json.at("m2m:uril")[0].get<std::string>();
-
-    return true;
 }
 
 // Discover the containers within the parentPath, and return the first via containerPath.
@@ -426,15 +422,23 @@ bool discover_container(const std::string& parentPath, std::string& containerPat
     for (int i = 0; i < json_str.length(); i += 150)
         logDebug("Container discovery [" << i << "]: " << json_str.substr(i, i + 150));
 
-    auto json = nlohmann::json::parse(json_str);
-    containerPath = json.at("m2m:uril")[0].get<std::string>();
-    if (containerPath.length() < 1)
+    try
     {
-        logWarn("Container not found");
+        auto json = nlohmann::json::parse(json_str);
+        containerPath = json.at("m2m:uril")[0].get<std::string>();
+        if (containerPath.length() < 1)
+        {
+            logWarn("Container not found");
+            return false;
+        }
+
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        logError("Failed to parse discovered container: " << e.what());
         return false;
     }
-
-    return true;
 }
 
 // Create a container of the given name and with the given expiry age (in seconds) in the given parent path.
@@ -447,8 +451,11 @@ bool create_container(const std::string& parentPath, const std::string& resource
 
     xsd::m2m::Container cnt = xsd::m2m::Container::Create();
     cnt.resourceName = resourceName;
-    // Hypothetically, setting a maximum of one instance should remove the need to delete instances after the IN-AE creates them.
-    // In practice, this doesn't seem to work, and the IN-CSE gives the IN-AE 405 errors after the first time.
+    // When content instances are created without specifying a name, the CSE gives them unique names.  Combined with a limit on the
+    // maximum number of content instances in the container, this results in a queue of content instances, which can be accessed via
+    // the "latest" and "oldest" reserved names.  This is the mechanism we use, with a queue depth of 1.
+    // Note that this will not work if the content instances are all created with the same name, as the CSE will treat a subsequent
+    // content instance with the same name as a conflict and return a 405 error.
     cnt.maxNrOfInstances = 1;
     cnt.maxInstanceAge = maxInstanceAge;
 
@@ -486,7 +493,7 @@ bool discover_content_instances(const std::string& parentPath)
     fc.filterUsage = xsd::m2m::FilterUsage::Discovery;
     fc.resourceType = xsd::m2m::ResourceTypeList();
     fc.resourceType->push_back(xsd::m2m::ResourceType::contentInstance);
-    fc.level = 1;
+    fc.level = 1;                                               // Limit recursion depth to just immediate children
 
     request.req->filterCriteria = std::move(fc);
 
@@ -495,12 +502,12 @@ bool discover_content_instances(const std::string& parentPath)
 
     if (response->responseStatusCode != xsd::m2m::ResponseStatusCode::OK)
     {
-        logWarn("meter read policy failed: " << toString(response->responseStatusCode));
+        logWarn("Meter read policy failed: " << toString(response->responseStatusCode));
         return false;
     }
 
     auto json = xsd::toAnyTypeUnnamed(response->primitiveContent).dumpJson();
-    logInfo("meter read policy: " << toString(response->responseStatusCode) << ", " << json);
+    logInfo("Meter read policy: " << toString(response->responseStatusCode) << ", " << json);
 
     return true;
 }
@@ -514,7 +521,9 @@ bool create_content_instance(const std::string& parentPath, const std::string& r
     request.req->eventCategory = (int)xsd::m2m::StdEventCats::Immediate;        // NOTE Mandatory cast to int
 
     xsd::m2m::ContentInstance cin = xsd::m2m::ContentInstance::Create();
-    cin.resourceName = resourceName;
+    // Set the conten instance's name, if provided; otherwise a unique one will be allocated by the CSE.
+    if (resourceName != "")
+        cin.resourceName = resourceName;
 
     ordered_json json;
     sampleSummary.json(json);
@@ -540,7 +549,7 @@ bool create_content_instance(const std::string& parentPath, const std::string& r
     return true;
 }
 
-// Delete the content instance at the given path.
+// Delete the content instance at the given path.  Not used in this demo.
 bool delete_content_instance(const std::string& path)
 {
     m2m::Request request = appEntity.newRequest(xsd::m2m::Operation::Delete, m2m::To{path});
@@ -582,11 +591,11 @@ void notificationCallback(m2m::Notification notification)
 {
     if (!notification.notificationEvent.isSet())
     {
-        logWarn("notification has no notificationEvent");
+        logWarn("Notification has no notificationEvent");
         return;
     }
 
-    logDebug("got notification type " << toString(notification.notificationEvent->notificationEventType));
+    logDebug("Got notification type " << toString(notification.notificationEvent->notificationEventType));
 
     if (notification.notificationEvent->notificationEventType != xsd::m2m::NotificationEventType::Create_of_Direct_Child_Resource)
     {
@@ -598,29 +607,46 @@ void notificationCallback(m2m::Notification notification)
     for (int i = 0; i < json_str.length(); i += 150)
         logDebug("ContentInstance [" << i << "]: " << json_str.substr(i, i + 150));
 
-    // Extract the resource name as a string and use it to run the appropriate handler.
-    auto json = nlohmann::json::parse(json_str);
-    auto rn = json.at("rn").get<std::string>();
-    if (rn == "reportInterval")
+    // Use the con element to decide how to handle the notification:
+    //   * {"con":{"svcdat":...}...}: Accumulate the metersvc data
+    //   * {"con":"{'reportInterval': 3600}",...}: Change our report interval (NOTE con is a JSON-like string in this case)
+    try
     {
-        auto seconds = json.at("con").get<int>();
+        auto json = nlohmann::json::parse(json_str);
+        auto con = json.at("con");
+        if (con.find("svcdat") != con.end())
+        {
+            auto meterRead = contentInstance.content->extractUnnamed<xsd::mtrsvc::MeterRead>();
+            auto &meterSvcData = *meterRead.meterSvcData;
+            parseMeterSvcData(meterSvcData);
 
-        // Before parsing, delete the config content instance to prevent 405 errors the next time the IN-AE creates one.
-//        delete_content_instance(APP_PATH_CONFIG);
-        deletionQueue.push(APP_PATH_CONFIG);
-        logDebug("Queued deletion of config content instance");
+            return;
+        }
 
-        parseReportInterval(seconds);
+        if (con.is_string())
+        {
+            auto json = nlohmann::json::parse(singleQuoteToDoubleQuote(con.get<std::string>()));
+            if (json.find("reportInterval") != json.end())
+            {
+                auto seconds = json.at("reportInterval");
+                if (seconds.is_number_integer())
+                    parseReportInterval(seconds);
+                else
+                    logWarn("Invalid report interval: " << con);
+            }
+            else
+            {
+                logInfo("Invalid string con: " << con.dump());
+            }
+
+            return;
+        }
+
+        logDebug("Notification has unknown content: " << con);
     }
-    else if (rn.compare(0, 3, "rri") == 0 && rn.compare(rn.length() - 16, 16, "-contentInstance") == 0)
+    catch (const std::exception& e)
     {
-        auto meterRead = contentInstance.content->extractUnnamed<xsd::mtrsvc::MeterRead>();
-        auto &meterSvcData = *meterRead.meterSvcData;
-        parseMeterSvcData(meterSvcData);
-    }
-    else
-    {
-        logWarn("Notification has unknown resource name: " << rn);
+        logError("Failed to parse content instance: " << e.what());
     }
 }
 
@@ -661,13 +687,14 @@ void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData)
             SampleSummary sampleSummary;
             report.summarise(sampleSummary);
 
-//            create_content_instance(containerPath, IN_AE_RESOURCE_NAME, sampleSummary);
+            // NOTE Since we expect to be called from within the notification handler, we must call create_content_instance()
+            // asynchronously, for which we use the sample queue.
             reportQueue.push(sampleSummary);
             logDebug("Queued summary of " << sampleSummary.count << " samples");
 
             report.reset();
             reportTime += milliseconds(reportPeriod * 1000);
-            if (reportTime <= timeNow)                              // Sanity check
+            if (reportTime <= timeNow)                          // Sanity check
             {
                 logWarn("Report time in the past; resetting to " << reportPeriod << " s from now");
                 reportTime = timeNow + milliseconds(reportPeriod * 1000);
@@ -675,26 +702,24 @@ void parseMeterSvcData(const xsd::mtrsvc::MeterSvcData& meterSvcData)
         }
     }
 
-    std::ofstream output("meter_data.txt");
     logInfo("timestamp: " << meterSvcData.readTimeLocal);
-    output << "timestamp: " << meterSvcData.readTimeLocal << '\n';
-    if (meterSvcData.powerQuality.isSet())
-    {
-        logInfo("powerQuality: " << *meterSvcData.powerQuality);
-        output << "powerQuality:\n" << *meterSvcData.powerQuality << '\n';
-    }
-    if (meterSvcData.summations.isSet())
-    {
-        logInfo("summations: " << *meterSvcData.summations);
-        output << "summations:\n" << *meterSvcData.summations << '\n';
-    }
-
     Sample sample;
-//    if (SPOOF_METER || !Sample::isValid(meterSvcData.powerQuality.getValue()))
     if (SPOOF_METER)
+    {
         spoofSample(sample);
-    else
+        report.accumulate(sample);
+        logInfo("Accumulated " << report.count() << (report.count() == 1 ? " sample" : " samples"));
+    }
+    else if (meterSvcData.powerQuality.isSet())
+    {
+        logDebug("powerQuality: " << *meterSvcData.powerQuality);
         sample.set(meterSvcData.powerQuality.getValue());
-    report.accumulate(sample);
-    logInfo("Accumulated " << report.count() << (report.count() == 1 ? " sample" : " samples"));
+        report.accumulate(sample);
+        logInfo("Accumulated " << report.count() << (report.count() == 1 ? " sample" : " samples"));
+    }
+    else if (meterSvcData.summations.isSet())
+    {
+        // Summation data are not used in this demo.
+        logDebug("summations: " << *meterSvcData.summations);
+    }
 }

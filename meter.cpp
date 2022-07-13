@@ -5,6 +5,32 @@
 
 using namespace Meter;
 
+#ifdef INTERVAL_ARRAY
+static constexpr int base64char[64]  = { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+                                         'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+                                         'g', 'h', 'I', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+                                         'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/' };
+
+// Return the character corresponding to the given integer value in the standard base64 encoding.
+// NOTE: Values outside the range 0 - 63 are wrapped.
+char base64(int val)
+{
+    return base64char[val & 0x3f];
+}
+
+// Return the base64 encoding of the given integer value between 0 and 10,000, mapped by a power law to the range 0 - 63.
+char msToBase64(int ms)
+{
+    int msPowerLawMapped = round(pow(ms, 0.449834));
+    if (msPowerLawMapped < 0)
+        msPowerLawMapped = 0;
+    if (msPowerLawMapped > 63)
+        msPowerLawMapped = 63;
+
+    return base64(msPowerLawMapped);
+}
+#endif
+
 // Round n to the given number of decimal places and return the result.
 static double round(double n, int decimalPlaces)
 {
@@ -82,6 +108,21 @@ void PhaseSummary::json(ordered_json& j) const
     j["pf"] = tmp;
 }
 
+#ifdef INTERVAL_ARRAY
+// Append the given character to the end of the array.
+bool CharArray::append(char c)
+{
+    if (index < maxEntries)
+    {
+        array[index++] = c;
+        array[index] = '\0';
+        return true;
+    }
+
+    return false;
+}
+#endif
+
 // Create a JSON object encoding the summary over the past n sample intervals.
 void SampleSummary::json(ordered_json& j) const
 {
@@ -97,10 +138,13 @@ void SampleSummary::json(ordered_json& j) const
     frequency.json(tmp);
     j["f"] = tmp;
     j["n"] = count;
-    j["is"] = round((double)intervalMin.count() / 1000, 3);
-    j["il"] = round((double)intervalMax.count() / 1000, 3);
     j["ts"] = duration_cast<seconds>(tsStart.time_since_epoch()).count();
     j["te"] = duration_cast<seconds>(tsEnd.time_since_epoch()).count();
+    j["is"] = round((double)intervalMin.count() / 1000, 3);
+    j["il"] = round((double)intervalMax.count() / 1000, 3);
+#ifdef INTERVAL_ARRAY
+    j["i"] = interval.array;
+#endif
 }
 
 // Accumulate the given sample.
@@ -218,11 +262,14 @@ bool Report::SampleAccumulator::accumulate(const Sample& sample)
     {
         count++;
         tsEnd = system_clock::now();
-        milliseconds interval = duration_cast<milliseconds>(tsEnd - tsLast);
-        if (interval < intervalMin)
-            intervalMin = interval;
-        if (interval > intervalMax)
-            intervalMax = interval;
+        milliseconds intervalLast = duration_cast<milliseconds>(tsEnd - tsLast);
+        if (intervalLast < intervalMin)
+            intervalMin = intervalLast;
+        if (intervalLast > intervalMax)
+            intervalMax = intervalLast;
+#ifdef INTERVAL_ARRAY
+        interval.append(msToBase64(intervalLast.count()));
+#endif
         tsLast = tsEnd;
 
         return true;
@@ -241,10 +288,14 @@ bool Report::SampleAccumulator::summarise(SampleSummary& sampleSummary) const
     bool successP3 = p3.summarise(sampleSummary.p3, count);
     bool successF = frequency.summarise(sampleSummary.frequency, count);
     sampleSummary.count = count;
-    sampleSummary.intervalMin = intervalMin;
-    sampleSummary.intervalMax = intervalMax;
     sampleSummary.tsStart = tsStart;
     sampleSummary.tsEnd = tsEnd;
+    sampleSummary.intervalMin = intervalMin;
+    sampleSummary.intervalMax = intervalMax;
+#ifdef INTERVAL_ARRAY
+    strncpy(sampleSummary.interval.array, interval.array, interval.index);
+    sampleSummary.interval.index = interval.index;
+#endif
 
     if (successP1 && successP2 && successP3 && successF)
         return true;

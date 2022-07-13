@@ -33,6 +33,8 @@ using namespace nlohmann;
 #define EXPECTED_VOLTAGE    230                                 // Options: 110 (for 100/110/120 V), 230 (for 220/230/240 V)
 #define EXPECTED_FREQUENCY   50                                 // Options: 50, 60
 
+//#define INTERVAL_ARRAY                                          // Maintain and transmit a base-64 encoded array of intervals
+
 namespace Meter
 {
     static constexpr uint32_t HISTOGRAM_BINS = 12;
@@ -130,23 +132,46 @@ namespace Meter
         Summary powerFactor;
     };
 
+#ifdef INTERVAL_ARRAY
+    // Fixed size, character-based array, used here to store base64-encoded time intervals in the range 0 through 10 seconds.
+    struct CharArray
+    {
+        static constexpr int maxEntries = 7200;
+
+        CharArray() { index = 0; }
+        bool append(char c);
+        void reset() { index = 0; array[0] = '\0'; }
+
+        char array[maxEntries + 1];
+        int index;
+    };
+#endif
+
     // Summary voltage/current/power of up to three phases plus frequency, as well as the count of samples covered.
     struct SampleSummary
     {
-        SampleSummary() { count = 0; }
+        SampleSummary() { count = 0; intervalMin = milliseconds(INT32_MAX); intervalMax = milliseconds(0); }
         void json(ordered_json& j) const;
-        void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0; intervalMin = milliseconds(INT32_MAX);
-                       intervalMax = milliseconds(0); tsStart = tsEnd = system_clock::now(); }
+        void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0;
+                       tsStart = tsEnd = system_clock::from_time_t(0);
+                       intervalMin = milliseconds(INT32_MAX); intervalMax = milliseconds(0);
+#ifdef INTERVAL_ARRAY
+                       interval.reset();
+#endif
+                     }
 
         PhaseSummary p1;
         PhaseSummary p2;
         PhaseSummary p3;
         Summary frequency;
         uint32_t count;
-        milliseconds intervalMin;
-        milliseconds intervalMax;
         time_point<system_clock> tsStart;
         time_point<system_clock> tsEnd;
+        milliseconds intervalMin;
+        milliseconds intervalMax;
+#ifdef INTERVAL_ARRAY
+        CharArray interval;
+#endif
     };
 
     class Report
@@ -233,22 +258,30 @@ namespace Meter
         // Accumulated voltage/current/power of up to three phases, frequency, and the count and timestamps.
         struct SampleAccumulator
         {
-            SampleAccumulator() { count = 0; }
+            SampleAccumulator() { count = 0; tsLast = tsStart = tsEnd = system_clock::now();
+                                  intervalMin = milliseconds(INT32_MAX); intervalMax = milliseconds(0); }
             bool accumulate(const Sample& sample);
             bool summarise(SampleSummary& sampleSummary) const;
-            void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0; intervalMin = milliseconds(INT32_MAX);
-                           intervalMax = milliseconds(0); tsLast = tsStart = tsEnd = system_clock::now(); }
+            void reset() { p1.reset(); p2.reset(); p3.reset(); frequency.reset(); count = 0; tsLast = tsStart = tsEnd;
+                           intervalMin = milliseconds(INT32_MAX); intervalMax = milliseconds(0);
+#ifdef INTERVAL_ARRAY
+                           interval.reset();
+#endif
+                         }
 
             PhaseAccumulator p1;
             PhaseAccumulator p2;
             PhaseAccumulator p3;
             AccumulatorFrequency frequency;
             uint32_t count;
-            milliseconds intervalMin;
-            milliseconds intervalMax;
             time_point<system_clock> tsLast;
             time_point<system_clock> tsStart;
             time_point<system_clock> tsEnd;
+            milliseconds intervalMin;
+            milliseconds intervalMax;
+#ifdef INTERVAL_ARRAY
+            CharArray interval;
+#endif
         };
 
         SampleAccumulator acc;                                  // Statically allocated meter sample accumulator
